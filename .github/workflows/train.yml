@@ -16,27 +16,20 @@ jobs:
   backfill_and_train:
     runs-on: ubuntu-latest
 
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Upgrade pip
-        run: |
-          python -m pip install --upgrade pip
-
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install \
             requests \
             pandas \
@@ -46,60 +39,39 @@ jobs:
             certifi \
             scikit-learn
 
-      - name: Create .env file
-        env:
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-        run: |
-          echo "OPENWEATHER_API_KEY=$OPENWEATHER_API_KEY" > .env
-          echo "MONGODB_URI=$MONGODB_URI" >> .env
-
       - name: Verify MongoDB connection
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
         run: |
           python - <<EOF
           from pymongo import MongoClient
-          import certifi
-          import os
-
-          uri = os.getenv("MONGODB_URI")
-
+          import certifi, os
           client = MongoClient(
-              uri,
+              os.getenv("MONGODB_URI"),
               tls=True,
               tlsCAFile=certifi.where(),
               serverSelectionTimeoutMS=30000
           )
-
           print(client.admin.command("ping"))
           print("MongoDB connection successful")
           EOF
 
       - name: Run backfill script
-        run: |
-          python backfill.py
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python backfill.py
 
       - name: Run training pipeline
-        run: |
-          python training_pipeline.py
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python training_pipeline.py
 
       - name: Commit and push changes
         run: |
           git config --global user.email "action@github.com"
           git config --global user.name "github-actions[bot]"
-
-          # Stage all changes
           git add -A
-
-          # Commit only if there are changes
           git diff --cached --quiet || git commit -m "Auto: Backfill data and train model"
-
-          # Retry rebase in case another workflow updated remote
-          for i in 1 2 3; do
-            git pull --rebase origin master && break
-            sleep 5
-          done
-
-          # Push latest changes
-          git push origin HEAD:master
+          git pull --rebase origin master
+          git push origin master

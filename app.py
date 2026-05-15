@@ -23,9 +23,11 @@ load_dotenv()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "aqi_predictor")
-MODEL_PATH = Path("data/model.pkl")
-SCALER_PATH = Path("data/scaler.pkl")
-FEATURES = ["co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"]
+MODEL_PATH = Path("data/aqi_xgb_model.pkl")
+LE_PATH = Path("data/label_encoder.pkl")
+FEAT_PATH = Path("data/feature_columns.pkl")
+POLLUTANTS = ["co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"]
+TARGET = "aqi"
 
 st.set_page_config(
     page_title="Karachi AQI Predictor",
@@ -121,15 +123,30 @@ def aqi_info(val):
     return              "Hazardous",                   "#dc2626", "⚫"
 
 
+def openweather_aqi_info(val):
+    if val is None:
+        return "Unknown", "#6b7280", "?"
+    labels = {
+        1: ("Good", "#22c55e", "1"),
+        2: ("Fair", "#84cc16", "2"),
+        3: ("Moderate", "#eab308", "3"),
+        4: ("Poor", "#f97316", "4"),
+        5: ("Very Poor", "#ef4444", "5"),
+    }
+    return labels.get(int(round(float(val))), ("Unknown", "#6b7280", "?"))
+
+
 @st.cache_resource(show_spinner="Loading model...")
 def load_model():
-    if not MODEL_PATH.exists() or not SCALER_PATH.exists():
-        return None, None
+    if not MODEL_PATH.exists() or not LE_PATH.exists() or not FEAT_PATH.exists():
+        return None, None, None
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
-    with open(SCALER_PATH, "rb") as f:
-        scaler = pickle.load(f)
-    return model, scaler
+    with open(LE_PATH, "rb") as f:
+        le = pickle.load(f)
+    with open(FEAT_PATH, "rb") as f:
+        feat_info = pickle.load(f)
+    return model, le, feat_info
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching live AQI...")
@@ -249,35 +266,78 @@ def load_history():
         return pd.DataFrame()
 
 
-def predict_3_days(model, scaler, live):
+def predict_72h(model, le, feat_info, live):
     predictions = []
-    if model is None or live is None:
+    if model is None or live is None or le is None:
         return predictions
-
-    base = {f: (live.get(f) or 0) for f in FEATURES}
-
-    # Simulate slight daily variation for day 2 and 3
-    for day in range(1, 4):
-        row   = {f: base[f] * (1 + np.random.uniform(-0.05, 0.05)) for f in FEATURES}
-        X     = np.array([[row[f] for f in FEATURES]])
-        X_s   = scaler.transform(X)
-        pred  = float(model.predict(X_s)[0])
-        date  = datetime.now() + timedelta(days=day)
-        predictions.append({
-            "day"  : date.strftime("%A"),
-            "date" : date.strftime("%b %d"),
-            "aqi"  : round(pred, 1),
-        })
-        # Use prediction as next base (chain forecasting)
-        base = row
-
+    
+    feature_cols = feat_info["feature_cols"]
+    df_ext = pd.DataFrame([live])
+    last_time = datetime.now()
+    
+    for h in range(1, 73):
+        next_time = last_time + timedelta(hours=h)
+        row = {}
+        
+        row["day_of_year"] = next_time.timetuple().tm_yday
+        row["week"] = next_time.isocalendar()[1]
+        
+        row["pm10_lag1"] = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 0
+        row["pm10_lag3"] = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 0
+        row["pm2_5_lag1"] = df_ext["pm2_5"].iloc[-1] if "pm2_5" in df_ext.columns else 0
+        row["aqi_lag1"] = df_ext[TARGET].iloc[-1] if TARGET in df_ext.columns else 3
+        row["co_lag12"] = df_ext["co"].iloc[-1] if "co" in df_ext.columns else 0
+        
+        pm10_val = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 50
+        pm2_5_val = df_ext["pm2_5"].iloc[-1] if "pm2_5" in df_ext.columns else 30
+        no2_val = df_ext["no2"].iloc[-1] if "no2" in df_ext.columns else 30
+        so2_val = df_ext["so2"].iloc[-1] if "so2" in df_ext.columns else 10
+        
+        row["pm_ratio"] = pm2_5_val / (pm10_val + 1e-6)
+        row["pm2_5_x_no2"] = pm2_5_val * no2_val
+        row["so2_x_pm10"] = so2_val * pm10_val
+        
+        row["aqi_trend3"] = 0
+        row["aqi_trend6"] = 0
+        
+        for col in POLLUTANTS:
+            if col not in row:
+                row[col] = df_ext[col].iloc[-1] if col in df_ext.columns else 0
+        
+        x_vec = np.array([row.get(f, 0.0) for f in feature_cols]).reshape(1, -1)
+        
+        try:
+            pred_enc = model.predict(x_vec)[0]
+            pred_proba = model.predict_proba(x_vec)[0]
+            pred_aqi = int(le.inverse_transform([pred_enc])[0])
+            confidence = float(pred_proba.max())
+            
+            predictions.append({
+                "datetime": next_time,
+                "hour": next_time.strftime("%H:%M"),
+                "day": next_time.strftime("%a"),
+                "date": next_time.strftime("%b %d"),
+                "predicted_aqi": pred_aqi,
+                "confidence": round(confidence * 100, 1),
+            })
+            
+            new_row = {c: np.nan for c in POLLUTANTS + [TARGET]}
+            new_row[TARGET] = pred_aqi
+            for col in POLLUTANTS:
+                new_row[col] = row.get(col, 0)
+            df_ext = pd.concat([df_ext, pd.DataFrame([new_row])], ignore_index=True)
+            
+        except Exception as e:
+            st.warning(f"Prediction error at hour {h}: {e}")
+            break
+    
     return predictions
 
 
-model, scaler = load_model()
-live          = fetch_live()
+model, le, feat_info = load_model()
+live = fetch_live()
 history = load_history()
-predictions = predict_3_days(model, scaler, live)
+predictions = predict_72h(model, le, feat_info, live)
 
 st.markdown("""
 <div style='padding: 8px 0 24px 0;'>
@@ -317,17 +377,18 @@ with cols[0]:
     </div>
     """, unsafe_allow_html=True)
 
-for i, pred in enumerate(predictions):
-    pc, pcolor, pemoji = aqi_info(pred["aqi"])
-    with cols[i + 1]:
-        st.markdown(f"""
-        <div class='aqi-card' style='border-color: {pcolor}40;'>
-            <div class='aqi-label'>{pred["day"]}</div>
-            <div class='aqi-number' style='color: {pcolor};'>{pred["aqi"]:.0f}</div>
-            <div class='aqi-category' style='color: {pcolor};'>{pemoji} {pc}</div>
-            <div style='color: #6b7280; font-size: 0.75rem; margin-top: 8px;'>{pred["date"]}</div>
-        </div>
-        """, unsafe_allow_html=True)
+if predictions:
+    for i, pred in enumerate(predictions[::24][:3]):
+        pc, pcolor, pclass = openweather_aqi_info(pred["predicted_aqi"])
+        with cols[i + 1]:
+            st.markdown(f"""
+            <div class='aqi-card' style='border-color: {pcolor}40;'>
+                <div class='aqi-label'>{pred["day"]}</div>
+                <div style='font-family: Syne, sans-serif; font-size: 1.65rem; font-weight: 800; color: {pcolor}; line-height: 1.1;'>{pc}</div>
+                <div class='aqi-category' style='color: {pcolor};'>OpenWeather class {pclass}</div>
+                <div style='color: #6b7280; font-size: 0.75rem; margin-top: 8px;'>{pred["date"]}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -366,14 +427,16 @@ with col_left:
 with col_right:
     st.markdown("<div class='section-title'>📊 3-Day Forecast</div>", unsafe_allow_html=True)
     if predictions:
-        days  = ["Today"] + [p["day"] for p in predictions]
-        aqi_v = [current_aqi] + [p["aqi"] for p in predictions]
-        colors_list = [aqi_info(v)[1] for v in aqi_v]
+        forecast_points = predictions[::6][:12]
+        hours = [p["hour"] for p in forecast_points]
+        aqi_v = [p["predicted_aqi"] for p in forecast_points]
+        labels = [openweather_aqi_info(v)[0] for v in aqi_v]
+        colors_list = [openweather_aqi_info(v)[1] for v in aqi_v]
 
         fig2 = go.Figure(go.Bar(
-            x=days, y=aqi_v,
+            x=hours, y=aqi_v,
             marker_color=colors_list,
-            text=[f"{v:.0f}" for v in aqi_v],
+            text=labels,
             textposition="outside",
             textfont=dict(color="#e5e7eb", size=13)
         ))
@@ -384,7 +447,14 @@ with col_right:
             height=280,
             margin=dict(l=0, r=0, t=24, b=0),
             xaxis=dict(showgrid=False),
-            yaxis=dict(gridcolor="rgba(255,255,255,0.05)", range=[0, max(aqi_v) * 1.3]),
+            yaxis=dict(
+                title="OpenWeather AQI class",
+                gridcolor="rgba(255,255,255,0.05)",
+                range=[0, 5.8],
+                tickmode="array",
+                tickvals=[1, 2, 3, 4, 5],
+                ticktext=["Good", "Fair", "Moderate", "Poor", "Very Poor"],
+            ),
             showlegend=False,
         )
         st.plotly_chart(fig2, use_container_width=True)
@@ -453,7 +523,8 @@ with st.sidebar:
     if model is not None:
         st.success("Model loaded ✓")
         st.caption("Type: Random Forest")
-        st.caption(f"Features: {len(FEATURES)}")
+        feature_cols = (feat_info.get("selected_features") or feat_info.get("feature_cols") or []) if feat_info else []
+        st.caption(f"Features: {len(feature_cols)}")
         if not history.empty:
             st.caption(f"Trained on: {len(history)} records")
     else:

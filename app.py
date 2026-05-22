@@ -1,25 +1,28 @@
 """
-app.py — Karachi AQI Predictor Dashboard
-Run locally:  streamlit run app.py
-Deploy:       streamlit.io/cloud
+Karachi AQI Predictor Dashboard
+
+Run locally:
+    streamlit run app.py
 """
 
 import os
 import pickle
-import requests
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import certifi
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
+import requests
+import streamlit as st
 from dotenv import load_dotenv
-from pathlib import Path
 from pymongo import MongoClient
-import certifi
 
 load_dotenv()
 
+LATITUDE = 24.8607
+LONGITUDE = 67.0011
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "aqi_predictor")
@@ -30,113 +33,284 @@ POLLUTANTS = ["co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"]
 TARGET = "aqi"
 
 st.set_page_config(
-    page_title="Karachi AQI Predictor",
-    page_icon="🌫️",
+    page_title="Karachi AQI Monitor",
+    page_icon="AQI",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root {
+    --bg: #0b1220;
+    --panel: #111827;
+    --panel-soft: #162033;
+    --border: rgba(148, 163, 184, 0.22);
+    --muted: #94a3b8;
+    --text: #e5eefb;
+}
 
 html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
+    font-family: 'Inter', sans-serif;
 }
 
-h1, h2, h3 { font-family: 'Syne', sans-serif !important; }
-
-.main { background: #0a0e1a; }
-.stApp { background: #0a0e1a; }
-
-.aqi-card {
-    background: linear-gradient(135deg, #111827 0%, #1a2236 100%);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
-    padding: 24px;
-    text-align: center;
-    transition: transform 0.2s;
-}
-.aqi-card:hover { transform: translateY(-2px); }
-
-.aqi-number {
-    font-family: 'Syne', sans-serif;
-    font-size: 3.5rem;
-    font-weight: 800;
-    line-height: 1;
+.stApp {
+    background:
+        radial-gradient(circle at 15% 0%, rgba(20, 184, 166, 0.12), transparent 30%),
+        linear-gradient(180deg, #0b1220 0%, #111827 58%, #0b1220 100%);
 }
 
-.aqi-label {
-    font-size: 0.8rem;
-    letter-spacing: 0.15em;
+section[data-testid="stSidebar"] {
+    background: rgba(11, 18, 32, 0.92);
+    border-right: 1px solid var(--border);
+}
+
+.block-container {
+    padding-top: 2.1rem;
+    padding-bottom: 2rem;
+}
+
+.topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 20px;
+    margin-bottom: 22px;
+}
+
+.eyebrow {
+    color: #38bdf8;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.13em;
     text-transform: uppercase;
-    color: #6b7280;
-    margin-bottom: 8px;
 }
 
-.aqi-category {
-    font-size: 0.95rem;
-    font-weight: 500;
+.title {
+    color: var(--text);
+    font-size: clamp(2rem, 4vw, 3.4rem);
+    font-weight: 800;
+    letter-spacing: 0;
+    line-height: 1.02;
+    margin-top: 4px;
+}
+
+.subtitle {
+    color: var(--muted);
+    margin-top: 9px;
+    max-width: 760px;
+}
+
+.status-pill {
+    border: 1px solid var(--border);
+    background: rgba(17, 24, 39, 0.72);
+    color: #cbd5e1;
+    border-radius: 999px;
+    padding: 9px 13px;
+    font-size: 0.84rem;
+    white-space: nowrap;
+}
+
+.metric-card, .forecast-card, .panel, .pollutant-card {
+    background: rgba(17, 24, 39, 0.84);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.20);
+}
+
+.metric-card {
+    min-height: 228px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.label {
+    color: var(--muted);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+}
+
+.aqi-value {
+    font-size: clamp(3.6rem, 7vw, 6.2rem);
+    font-weight: 800;
+    line-height: 0.95;
+    letter-spacing: 0;
+}
+
+.category {
+    font-size: 1.18rem;
+    font-weight: 800;
     margin-top: 8px;
 }
 
-.alert-box {
-    background: linear-gradient(135deg, #3b0000, #1a0000);
-    border: 1px solid #ef4444;
-    border-radius: 12px;
-    padding: 16px 20px;
-    color: #fca5a5;
-    font-weight: 500;
-    margin: 16px 0;
+.fineprint {
+    color: var(--muted);
+    font-size: 0.8rem;
 }
 
-.pollutant-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.05);
+.forecast-card {
+    min-height: 228px;
+    padding: 20px;
+}
+
+.forecast-date {
+    color: #cbd5e1;
+    font-size: 0.88rem;
+    margin-top: 2px;
+}
+
+.forecast-value {
+    font-size: 2.8rem;
+    font-weight: 800;
+    line-height: 1;
+    margin-top: 25px;
+}
+
+.forecast-note {
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin-top: 14px;
+}
+
+.panel {
+    padding: 18px;
+    min-height: 340px;
 }
 
 .section-title {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.1rem;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    color: #e5e7eb;
-    margin-bottom: 16px;
+    color: #e2e8f0;
+    font-size: 0.92rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
+    margin-bottom: 12px;
+}
+
+.pollutant-card {
+    padding: 16px;
+    min-height: 128px;
+}
+
+.pollutant-value {
+    font-size: 1.7rem;
+    font-weight: 800;
+    margin-top: 6px;
+}
+
+.bar-track {
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.18);
+    overflow: hidden;
+    margin-top: 13px;
+}
+
+.bar-fill {
+    height: 100%;
+    border-radius: 999px;
+}
+
+.alert-box {
+    background: rgba(127, 29, 29, 0.32);
+    border: 1px solid rgba(248, 113, 113, 0.55);
+    color: #fecaca;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 18px;
+    font-weight: 600;
+}
+
+@media (max-width: 760px) {
+    .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    .status-pill {
+        white-space: normal;
+    }
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
-def aqi_info(val):
-    if val is None:
-        return "Unknown", "#6b7280", "❓"
-    val = float(val)
-    if val <= 50:   return "Good",                     "#22c55e", "🟢"
-    if val <= 100:  return "Moderate",                 "#eab308", "🟡"
-    if val <= 150:  return "Unhealthy for Sensitive",  "#f97316", "🟠"
-    if val <= 200:  return "Unhealthy",                "#ef4444", "🔴"
-    if val <= 300:  return "Very Unhealthy",           "#a855f7", "🟣"
-    return              "Hazardous",                   "#dc2626", "⚫"
+def aqi_info(value):
+    if value is None or pd.isna(value):
+        return "Unknown", "#94a3b8"
+    value = float(value)
+    if value <= 50:
+        return "Good", "#22c55e"
+    if value <= 100:
+        return "Moderate", "#facc15"
+    if value <= 150:
+        return "Unhealthy for Sensitive", "#fb923c"
+    if value <= 200:
+        return "Unhealthy", "#f87171"
+    if value <= 300:
+        return "Very Unhealthy", "#c084fc"
+    return "Hazardous", "#ef4444"
 
 
-def openweather_aqi_info(val):
-    if val is None:
-        return "Unknown", "#6b7280", "?"
-    labels = {
-        1: ("Good", "#22c55e", "1"),
-        2: ("Fair", "#84cc16", "2"),
-        3: ("Moderate", "#eab308", "3"),
-        4: ("Poor", "#f97316", "4"),
-        5: ("Very Poor", "#ef4444", "5"),
+def pollutant_subindex(value, breakpoints):
+    if value is None or pd.isna(value):
+        return None
+    value = float(value)
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c_low <= value <= c_high:
+            return ((i_high - i_low) / (c_high - c_low)) * (value - c_low) + i_low
+    c_low, c_high, i_low, i_high = breakpoints[-1]
+    return ((i_high - i_low) / (c_high - c_low)) * (min(value, c_high) - c_low) + i_low
+
+
+def calculate_numeric_aqi(components):
+    """Approximate US EPA-style AQI from OpenWeather pollutant concentrations."""
+    breakpoints = {
+        "pm2_5": [(0, 12, 0, 50), (12.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+                  (55.5, 150.4, 151, 200), (150.5, 250.4, 201, 300), (250.5, 500.4, 301, 500)],
+        "pm10": [(0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150),
+                 (255, 354, 151, 200), (355, 424, 201, 300), (425, 604, 301, 500)],
+        "no2": [(0, 53, 0, 50), (54, 100, 51, 100), (101, 360, 101, 150),
+                (361, 649, 151, 200), (650, 1249, 201, 300), (1250, 2049, 301, 500)],
+        "o3": [(0, 54, 0, 50), (55, 70, 51, 100), (71, 85, 101, 150),
+               (86, 105, 151, 200), (106, 200, 201, 300)],
     }
-    return labels.get(int(round(float(val))), ("Unknown", "#6b7280", "?"))
+
+    indexes = [
+        pollutant_subindex(components.get(name), bp)
+        for name, bp in breakpoints.items()
+    ]
+    indexes = [idx for idx in indexes if idx is not None]
+    return round(max(indexes), 1) if indexes else None
 
 
-@st.cache_resource(show_spinner="Loading model...")
+def parse_pollution_item(item):
+    components = item.get("components", {})
+    dt = datetime.fromtimestamp(item.get("dt", datetime.now().timestamp()))
+    return {
+        "datetime": dt,
+        "aqi": calculate_numeric_aqi(components),
+        "openweather_class": item.get("main", {}).get("aqi"),
+        **{name: components.get(name) for name in POLLUTANTS},
+    }
+
+
+def openweather_get(endpoint, params):
+    url = f"https://api.openweathermap.org/data/2.5/{endpoint}"
+    response = requests.get(url, params=params, timeout=12)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_resource(show_spinner="Loading model artifacts...")
 def load_model():
     if not MODEL_PATH.exists() or not LE_PATH.exists() or not FEAT_PATH.exists():
         return None, None, None
@@ -149,102 +323,51 @@ def load_model():
     return model, le, feat_info
 
 
-@st.cache_data(ttl=3600, show_spinner="Fetching live AQI...")
+@st.cache_data(ttl=1800, show_spinner="Fetching live air quality...")
 def fetch_live():
-    url = f"https://api.openweathermap.org/data/2.5/air_pollution?lat=24.8607&lon=67.0011&appid={OPENWEATHER_API_KEY}"
-    weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat=24.8607&lon=67.0011&appid={OPENWEATHER_API_KEY}&units=metric"
-    
+    if not OPENWEATHER_API_KEY:
+        return None
+
+    params = {"lat": LATITUDE, "lon": LONGITUDE, "appid": OPENWEATHER_API_KEY}
+    weather_params = {**params, "units": "metric"}
+
     try:
-        aqi_resp = requests.get(url, timeout=10).json()
-        weather_resp = requests.get(weather_url, timeout=10).json()
-    except Exception:
+        pollution = openweather_get("air_pollution", params)
+        weather = openweather_get("weather", weather_params)
+    except requests.RequestException:
         return None
-    
-    if aqi_resp.get("list") is None or weather_resp.get("main") is None:
+
+    records = pollution.get("list") or []
+    if not records or weather.get("main") is None:
         return None
-    
-    aqi_data = aqi_resp["list"][0]
-    components = aqi_data.get("components", {})
-    main = weather_resp.get("main", {})
-    wind = weather_resp.get("wind", {})
-    
-    def calculate_aqi(components):
-        pm2_5 = components.get("pm2_5")
-        pm10 = components.get("pm10")
-        no2 = components.get("no2")
-        o3 = components.get("o3")
-        
-        aqi_values = []
-        
-        if pm2_5 is not None:
-            if pm2_5 <= 12:
-                aqi_values.append((pm2_5 / 12) * 50)
-            elif pm2_5 <= 35.4:
-                aqi_values.append(50 + ((pm2_5 - 12) / 23.4) * 50)
-            elif pm2_5 <= 55.4:
-                aqi_values.append(100 + ((pm2_5 - 35.4) / 20) * 50)
-            elif pm2_5 <= 150.4:
-                aqi_values.append(150 + ((pm2_5 - 55.4) / 95) * 50)
-            else:
-                aqi_values.append(200 + ((pm2_5 - 150.4) / 249.6) * 100)
-        
-        if pm10 is not None:
-            if pm10 <= 54:
-                aqi_values.append((pm10 / 54) * 50)
-            elif pm10 <= 154:
-                aqi_values.append(50 + ((pm10 - 54) / 100) * 50)
-            elif pm10 <= 254:
-                aqi_values.append(100 + ((pm10 - 154) / 100) * 50)
-            elif pm10 <= 354:
-                aqi_values.append(150 + ((pm10 - 254) / 100) * 50)
-            else:
-                aqi_values.append(200 + ((pm10 - 354) / 646) * 100)
-        
-        if no2 is not None:
-            if no2 <= 53:
-                aqi_values.append((no2 / 53) * 50)
-            elif no2 <= 100:
-                aqi_values.append(50 + ((no2 - 53) / 47) * 50)
-            elif no2 <= 360:
-                aqi_values.append(100 + ((no2 - 100) / 260) * 50)
-            elif no2 <= 649:
-                aqi_values.append(150 + ((no2 - 360) / 289) * 50)
-            else:
-                aqi_values.append(200 + ((no2 - 649) / 1251) * 100)
-        
-        if o3 is not None:
-            if o3 <= 54:
-                aqi_values.append((o3 / 54) * 50)
-            elif o3 <= 70:
-                aqi_values.append(50 + ((o3 - 54) / 16) * 50)
-            elif o3 <= 85:
-                aqi_values.append(100 + ((o3 - 70) / 15) * 50)
-            elif o3 <= 105:
-                aqi_values.append(150 + ((o3 - 85) / 20) * 50)
-            else:
-                aqi_values.append(200 + ((o3 - 105) / 405) * 100)
-        
-        return max(aqi_values) if aqi_values else 50
-    
-    aqi = calculate_aqi(components)
-    
-    return {
-        "aqi"        : aqi,
-        "pm2_5"      : components.get("pm2_5"),
-        "pm10"       : components.get("pm10"),
-        "no2"        : components.get("no2"),
-        "o3"         : components.get("o3"),
-        "co"         : components.get("co"),
-        "so2"        : components.get("so2"),
-        "no"         : components.get("no"),
-        "nh3"        : components.get("nh3"),
+
+    live = parse_pollution_item(records[0])
+    main = weather.get("main", {})
+    wind = weather.get("wind", {})
+    live.update({
         "temperature": main.get("temp"),
-        "humidity"   : main.get("humidity"),
-        "wind_speed" : wind.get("speed"),
-        "pressure"   : main.get("pressure"),
-        "time"       : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "station"    : "Karachi",
-    }
+        "humidity": main.get("humidity"),
+        "wind_speed": wind.get("speed"),
+        "pressure": main.get("pressure"),
+        "station": "Karachi",
+    })
+    return live
+
+
+@st.cache_data(ttl=1800, show_spinner="Fetching 3-day forecast...")
+def fetch_openweather_forecast():
+    if not OPENWEATHER_API_KEY:
+        return []
+
+    params = {"lat": LATITUDE, "lon": LONGITUDE, "appid": OPENWEATHER_API_KEY}
+    try:
+        forecast = openweather_get("air_pollution/forecast", params)
+    except requests.RequestException:
+        return []
+
+    points = [parse_pollution_item(item) for item in forecast.get("list", [])]
+    cutoff = datetime.now() + timedelta(hours=72)
+    return [point for point in points if point["datetime"] <= cutoff and point["aqi"] is not None]
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading history...")
@@ -252,11 +375,18 @@ def load_history():
     if not MONGODB_URI:
         return pd.DataFrame()
     try:
-        client = MongoClient(MONGODB_URI, tls=True, tlsCAFile=certifi.where(),
-                             serverSelectionTimeoutMS=8000)
-        db  = client[MONGODB_DB]
-        col = db["aqi_data"]
-        records = list(col.find({}, {"_id": 0}).sort("datetime", -1).limit(720))
+        client = MongoClient(
+            MONGODB_URI,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=8000,
+        )
+        records = list(
+            client[MONGODB_DB]["aqi_data"]
+            .find({}, {"_id": 0})
+            .sort("datetime", -1)
+            .limit(720)
+        )
         if not records:
             return pd.DataFrame()
         df = pd.DataFrame(records)
@@ -266,276 +396,313 @@ def load_history():
         return pd.DataFrame()
 
 
-def predict_72h(model, le, feat_info, live):
+def predict_model_fallback(model, le, feat_info, live):
     predictions = []
-    if model is None or live is None or le is None:
+    if model is None or le is None or feat_info is None or live is None:
         return predictions
-    
-    feature_cols = feat_info["feature_cols"]
+
+    feature_cols = feat_info.get("selected_features") or feat_info.get("feature_cols") or []
+    if not feature_cols:
+        return predictions
+
     df_ext = pd.DataFrame([live])
     last_time = datetime.now()
-    
+
     for h in range(1, 73):
         next_time = last_time + timedelta(hours=h)
-        row = {}
-        
-        row["day_of_year"] = next_time.timetuple().tm_yday
-        row["week"] = next_time.isocalendar()[1]
-        
-        row["pm10_lag1"] = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 0
-        row["pm10_lag3"] = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 0
-        row["pm2_5_lag1"] = df_ext["pm2_5"].iloc[-1] if "pm2_5" in df_ext.columns else 0
-        row["aqi_lag1"] = df_ext[TARGET].iloc[-1] if TARGET in df_ext.columns else 3
-        row["co_lag12"] = df_ext["co"].iloc[-1] if "co" in df_ext.columns else 0
-        
-        pm10_val = df_ext["pm10"].iloc[-1] if "pm10" in df_ext.columns else 50
-        pm2_5_val = df_ext["pm2_5"].iloc[-1] if "pm2_5" in df_ext.columns else 30
-        no2_val = df_ext["no2"].iloc[-1] if "no2" in df_ext.columns else 30
-        so2_val = df_ext["so2"].iloc[-1] if "so2" in df_ext.columns else 10
-        
-        row["pm_ratio"] = pm2_5_val / (pm10_val + 1e-6)
-        row["pm2_5_x_no2"] = pm2_5_val * no2_val
-        row["so2_x_pm10"] = so2_val * pm10_val
-        
-        row["aqi_trend3"] = 0
-        row["aqi_trend6"] = 0
-        
+        row = {
+            "day_of_year": next_time.timetuple().tm_yday,
+            "week": next_time.isocalendar()[1],
+        }
+
         for col in POLLUTANTS:
-            if col not in row:
-                row[col] = df_ext[col].iloc[-1] if col in df_ext.columns else 0
-        
+            row[col] = df_ext[col].iloc[-1] if col in df_ext.columns and not pd.isna(df_ext[col].iloc[-1]) else 0
+
+        pm10_val = row.get("pm10", 0)
+        pm2_5_val = row.get("pm2_5", 0)
+        no2_val = row.get("no2", 0)
+        so2_val = row.get("so2", 0)
+
+        row.update({
+            "pm10_lag1": pm10_val,
+            "pm10_lag3": pm10_val,
+            "pm2_5_lag1": pm2_5_val,
+            "aqi_lag1": df_ext[TARGET].iloc[-1] if TARGET in df_ext.columns else live.get("openweather_class", 3),
+            "co_lag12": row.get("co", 0),
+            "pm_ratio": pm2_5_val / (pm10_val + 1e-6),
+            "pm2_5_x_no2": pm2_5_val * no2_val,
+            "so2_x_pm10": so2_val * pm10_val,
+            "aqi_trend3": 0,
+            "aqi_trend6": 0,
+        })
+
         x_vec = np.array([row.get(f, 0.0) for f in feature_cols]).reshape(1, -1)
-        
         try:
             pred_enc = model.predict(x_vec)[0]
-            pred_proba = model.predict_proba(x_vec)[0]
-            pred_aqi = int(le.inverse_transform([pred_enc])[0])
-            confidence = float(pred_proba.max())
-            
-            predictions.append({
-                "datetime": next_time,
-                "hour": next_time.strftime("%H:%M"),
-                "day": next_time.strftime("%a"),
-                "date": next_time.strftime("%b %d"),
-                "predicted_aqi": pred_aqi,
-                "confidence": round(confidence * 100, 1),
-            })
-            
-            new_row = {c: np.nan for c in POLLUTANTS + [TARGET]}
-            new_row[TARGET] = pred_aqi
-            for col in POLLUTANTS:
-                new_row[col] = row.get(col, 0)
-            df_ext = pd.concat([df_ext, pd.DataFrame([new_row])], ignore_index=True)
-            
-        except Exception as e:
-            st.warning(f"Prediction error at hour {h}: {e}")
+            pred_class = int(le.inverse_transform([pred_enc])[0])
+            confidence = float(model.predict_proba(x_vec)[0].max()) if hasattr(model, "predict_proba") else None
+        except Exception:
             break
-    
+
+        class_to_aqi = {1: 35, 2: 75, 3: 125, 4: 175, 5: 225}
+        predictions.append({
+            "datetime": next_time,
+            "aqi": class_to_aqi.get(pred_class, None),
+            "openweather_class": pred_class,
+            "confidence": confidence,
+        })
+
+        next_row = {name: row.get(name, 0) for name in POLLUTANTS}
+        next_row[TARGET] = pred_class
+        df_ext = pd.concat([df_ext, pd.DataFrame([next_row])], ignore_index=True)
+
     return predictions
+
+
+def summarize_daily(points):
+    if not points:
+        return []
+
+    df = pd.DataFrame(points)
+    df["date_only"] = df["datetime"].dt.date
+    summaries = []
+
+    for date_value, group in df.groupby("date_only"):
+        if date_value <= datetime.now().date():
+            continue
+        peak_idx = group["aqi"].astype(float).idxmax()
+        peak = group.loc[peak_idx]
+        summaries.append({
+            "date": pd.to_datetime(date_value),
+            "aqi": float(peak["aqi"]),
+            "peak_time": peak["datetime"].strftime("%H:%M"),
+            "mean_aqi": float(group["aqi"].mean()),
+        })
+        if len(summaries) == 3:
+            break
+
+    return summaries
+
+
+def figure_layout(height=320):
+    return dict(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#cbd5e1", family="Inter"),
+        height=height,
+        margin=dict(l=4, r=4, t=16, b=4),
+        xaxis=dict(gridcolor="rgba(148,163,184,0.12)", zeroline=False),
+        yaxis=dict(gridcolor="rgba(148,163,184,0.12)", zeroline=False),
+        showlegend=False,
+    )
+
+
+def render_aqi_card(label, value, footer, large=False):
+    category, color = aqi_info(value)
+    value_text = "N/A" if value is None or pd.isna(value) else f"{value:.0f}"
+    cls = "aqi-value" if large else "forecast-value"
+    card_cls = "metric-card" if large else "forecast-card"
+    return f"""
+    <div class="{card_cls}" style="border-color: {color}66;">
+        <div>
+            <div class="label">{label}</div>
+            <div class="{cls}" style="color: {color};">{value_text}</div>
+            <div class="category" style="color: {color};">{category}</div>
+        </div>
+        <div class="fineprint">{footer}</div>
+    </div>
+    """
 
 
 model, le, feat_info = load_model()
 live = fetch_live()
 history = load_history()
-predictions = predict_72h(model, le, feat_info, live)
+forecast_points = fetch_openweather_forecast()
+forecast_source = "OpenWeather pollutant forecast"
 
-st.markdown("""
-<div style='padding: 8px 0 24px 0;'>
-  <div style='font-family: Syne, sans-serif; font-size: 2rem; font-weight: 800; color: #f9fafb;'>
-    🌫️ Karachi AQI Predictor
-  </div>
-  <div style='color: #6b7280; font-size: 0.9rem; margin-top: 4px;'>
-    Real-time air quality monitoring & 3-day forecast
-  </div>
+if not forecast_points and live is not None:
+    forecast_points = predict_model_fallback(model, le, feat_info, live)
+    forecast_source = "model fallback"
+
+daily_forecast = summarize_daily(forecast_points)
+
+st.markdown(
+    """
+<div class="topbar">
+    <div>
+        <div class="eyebrow">Karachi air quality</div>
+        <div class="title">AQI monitor and 72-hour outlook</div>
+        <div class="subtitle">
+            Live pollutant readings, daily peak forecast, and recent air quality movement on one consistent numeric AQI scale.
+        </div>
+    </div>
+    <div class="status-pill">Forecast source: {source}</div>
 </div>
-""", unsafe_allow_html=True)
+""".format(source=forecast_source),
+    unsafe_allow_html=True,
+)
 
 if live is None:
-    st.error("Could not fetch live data from OpenWeather. Check your API key.")
+    st.error("Could not fetch live data from OpenWeather. Check OPENWEATHER_API_KEY and try again.")
     st.stop()
 
 current_aqi = live["aqi"]
-cat, color, emoji = aqi_info(current_aqi)
+current_cat, current_color = aqi_info(current_aqi)
 
-if current_aqi > 150:
-    st.markdown(f"""
-    <div class='alert-box'>
-        ⚠️ <strong>HEALTH ALERT</strong> — Current AQI is <strong>{current_aqi:.0f}</strong> ({cat}).
-        Avoid prolonged outdoor activity. Sensitive groups should stay indoors.
-    </div>
-    """, unsafe_allow_html=True)
+if current_aqi and current_aqi > 150:
+    st.markdown(
+        f"""
+        <div class="alert-box">
+            Health alert: current AQI is <strong>{current_aqi:.0f}</strong> ({current_cat}).
+            Limit prolonged outdoor activity, especially for sensitive groups.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-cols = st.columns(4)
+forecast_cols = st.columns(4)
+with forecast_cols[0]:
+    st.markdown(
+        render_aqi_card(
+            "Right now",
+            current_aqi,
+            f"Updated {live['datetime'].strftime('%b %d, %H:%M')}",
+            large=True,
+        ),
+        unsafe_allow_html=True,
+    )
 
-with cols[0]:
-    st.markdown(f"""
-    <div class='aqi-card' style='border-color: {color}40;'>
-        <div class='aqi-label'>Right Now</div>
-        <div class='aqi-number' style='color: {color};'>{current_aqi:.0f}</div>
-        <div class='aqi-category' style='color: {color};'>{emoji} {cat}</div>
-        <div style='color: #6b7280; font-size: 0.75rem; margin-top: 8px;'>{live["time"]}</div>
-    </div>
-    """, unsafe_allow_html=True)
+for idx, day in enumerate(daily_forecast[:3], start=1):
+    with forecast_cols[idx]:
+        footer = f"Peak near {day['peak_time']} - daily avg {day['mean_aqi']:.0f}"
+        st.markdown(
+            render_aqi_card(day["date"].strftime("%A"), day["aqi"], footer),
+            unsafe_allow_html=True,
+        )
 
-if predictions:
-    for i, pred in enumerate(predictions[::24][:3]):
-        pc, pcolor, pclass = openweather_aqi_info(pred["predicted_aqi"])
-        with cols[i + 1]:
-            st.markdown(f"""
-            <div class='aqi-card' style='border-color: {pcolor}40;'>
-                <div class='aqi-label'>{pred["day"]}</div>
-                <div style='font-family: Syne, sans-serif; font-size: 1.65rem; font-weight: 800; color: {pcolor}; line-height: 1.1;'>{pc}</div>
-                <div class='aqi-category' style='color: {pcolor};'>OpenWeather class {pclass}</div>
-                <div style='color: #6b7280; font-size: 0.75rem; margin-top: 8px;'>{pred["date"]}</div>
-            </div>
-            """, unsafe_allow_html=True)
+for idx in range(len(daily_forecast) + 1, 4):
+    with forecast_cols[idx]:
+        st.markdown(
+            render_aqi_card("Forecast", None, "Waiting for forecast data"),
+            unsafe_allow_html=True,
+        )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-col_left, col_right = st.columns([2, 1])
+chart_left, chart_right = st.columns([1.45, 1])
 
-with col_left:
-    st.markdown("<div class='section-title'>📈 Historical AQI Trend</div>", unsafe_allow_html=True)
-    if not history.empty:
-        hist7 = history.tail(168)
+with chart_left:
+    st.markdown('<div class="panel"><div class="section-title">Recent AQI trend</div>', unsafe_allow_html=True)
+    if not history.empty and "aqi" in history.columns:
+        hist = history.tail(168)
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=hist7["datetime"], y=hist7["aqi"],
-            mode="lines", name="AQI",
-            line=dict(color="#60a5fa", width=2),
+            x=hist["datetime"],
+            y=hist["aqi"],
+            mode="lines",
+            line=dict(color="#38bdf8", width=3),
             fill="tozeroy",
-            fillcolor="rgba(96,165,250,0.08)"
+            fillcolor="rgba(56,189,248,0.12)",
+            hovertemplate="%{x|%b %d %H:%M}<br>AQI %{y:.0f}<extra></extra>",
         ))
-        fig.add_hline(y=100, line_dash="dot", line_color="#eab308",
-                      annotation_text="Moderate", annotation_font_color="#eab308")
-        fig.add_hline(y=150, line_dash="dot", line_color="#ef4444",
-                      annotation_text="Unhealthy", annotation_font_color="#ef4444")
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#9ca3af",
-            height=280,
-            margin=dict(l=0, r=0, t=10, b=0),
-            xaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
-            yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
-            showlegend=False,
-        )
+        for y, name, color in [(50, "Good", "#22c55e"), (100, "Moderate", "#facc15"), (150, "Unhealthy", "#f87171")]:
+            fig.add_hline(y=y, line_dash="dot", line_color=color, annotation_text=name, annotation_font_color=color)
+        fig.update_layout(**figure_layout(318))
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No historical data yet. Run backfill.py first.")
+        st.info("No historical data found yet. Run the backfill/training workflow to populate MongoDB.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-with col_right:
-    st.markdown("<div class='section-title'>📊 3-Day Forecast</div>", unsafe_allow_html=True)
-    if predictions:
-        forecast_points = predictions[::6][:12]
-        hours = [p["hour"] for p in forecast_points]
-        aqi_v = [p["predicted_aqi"] for p in forecast_points]
-        labels = [openweather_aqi_info(v)[0] for v in aqi_v]
-        colors_list = [openweather_aqi_info(v)[1] for v in aqi_v]
-
-        fig2 = go.Figure(go.Bar(
-            x=hours, y=aqi_v,
-            marker_color=colors_list,
-            text=labels,
-            textposition="outside",
-            textfont=dict(color="#e5e7eb", size=13)
+with chart_right:
+    st.markdown('<div class="panel"><div class="section-title">Next 72 hours</div>', unsafe_allow_html=True)
+    if forecast_points:
+        forecast_df = pd.DataFrame(forecast_points)
+        sampled = forecast_df.iloc[::3].copy()
+        colors = [aqi_info(v)[1] for v in sampled["aqi"]]
+        fig = go.Figure(go.Bar(
+            x=sampled["datetime"],
+            y=sampled["aqi"],
+            marker_color=colors,
+            hovertemplate="%{x|%b %d %H:%M}<br>AQI %{y:.0f}<extra></extra>",
         ))
-        fig2.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#9ca3af",
-            height=280,
-            margin=dict(l=0, r=0, t=24, b=0),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(
-                title="OpenWeather AQI class",
-                gridcolor="rgba(255,255,255,0.05)",
-                range=[0, 5.8],
-                tickmode="array",
-                tickvals=[1, 2, 3, 4, 5],
-                ticktext=["Good", "Fair", "Moderate", "Poor", "Very Poor"],
-            ),
-            showlegend=False,
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+        fig.update_layout(**figure_layout(318))
+        fig.update_yaxes(title="AQI", range=[0, max(180, float(sampled["aqi"].max()) * 1.15)])
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Forecast data is unavailable right now.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("<div class='section-title'>🔬 Pollutant Breakdown</div>", unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
+st.markdown('<div class="section-title">Current pollutant readings</div>', unsafe_allow_html=True)
 
 pollutants = {
-    "PM2.5": (live.get("pm2_5"), "µg/m³", 35),
-    "PM10" : (live.get("pm10"),  "µg/m³", 50),
-    "NO₂"  : (live.get("no2"),   "µg/m³", 25),
-    "O₃"   : (live.get("o3"),    "µg/m³", 60),
-    "CO"   : (live.get("co"),    "µg/m³", 4000),
-    "SO₂"  : (live.get("so2"),   "µg/m³", 20),
+    "PM2.5": (live.get("pm2_5"), "ug/m3", 35),
+    "PM10": (live.get("pm10"), "ug/m3", 50),
+    "NO2": (live.get("no2"), "ug/m3", 25),
+    "O3": (live.get("o3"), "ug/m3", 60),
+    "CO": (live.get("co"), "ug/m3", 4000),
+    "SO2": (live.get("so2"), "ug/m3", 20),
 }
 
-pcols = st.columns(len(pollutants))
-for col, (name, (val, unit, safe_limit)) in zip(pcols, pollutants.items()):
+pollutant_cols = st.columns(6)
+for col, (name, (value, unit, reference)) in zip(pollutant_cols, pollutants.items()):
     with col:
-        if val is not None:
-            pct     = min(float(val) / safe_limit, 1.0)
-            pcolor  = "#22c55e" if pct < 0.5 else "#eab308" if pct < 0.8 else "#ef4444"
-            st.markdown(f"""
-            <div class='aqi-card' style='padding: 16px;'>
-                <div style='color: #6b7280; font-size: 0.75rem; letter-spacing: 0.1em; 
-                            text-transform: uppercase;'>{name}</div>
-                <div style='font-family: Syne, sans-serif; font-size: 1.6rem; 
-                            font-weight: 700; color: {pcolor}; margin: 4px 0;'>
-                    {val:.1f}
+        if value is None or pd.isna(value):
+            st.markdown(
+                f"""
+                <div class="pollutant-card">
+                    <div class="label">{name}</div>
+                    <div class="pollutant-value" style="color:#64748b;">N/A</div>
+                    <div class="fineprint">{unit}</div>
                 </div>
-                <div style='color: #6b7280; font-size: 0.72rem;'>{unit}</div>
-                <div style='background: #1f2937; border-radius: 4px; 
-                            height: 4px; margin-top: 10px;'>
-                    <div style='background: {pcolor}; width: {pct*100:.0f}%; 
-                                height: 4px; border-radius: 4px;'></div>
-                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            continue
+
+        ratio = min(float(value) / reference, 1.35)
+        color = "#22c55e" if ratio < 0.55 else "#facc15" if ratio < 0.95 else "#f87171"
+        width = min(ratio, 1) * 100
+        st.markdown(
+            f"""
+            <div class="pollutant-card">
+                <div class="label">{name}</div>
+                <div class="pollutant-value" style="color:{color};">{value:.1f}</div>
+                <div class="fineprint">{unit}</div>
+                <div class="bar-track"><div class="bar-fill" style="width:{width:.0f}%; background:{color};"></div></div>
             </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class='aqi-card' style='padding: 16px;'>
-                <div style='color: #6b7280; font-size: 0.75rem; letter-spacing: 0.1em;
-                            text-transform: uppercase;'>{name}</div>
-                <div style='color: #374151; font-size: 1.2rem; margin-top: 8px;'>N/A</div>
-            </div>
-            """, unsafe_allow_html=True)
+            """,
+            unsafe_allow_html=True,
+        )
 
 with st.sidebar:
-    st.markdown("### 🌤 Weather")
+    st.markdown("### Weather")
     weather = {
-        "🌡 Temperature" : f"{live['temperature']} °C" if live['temperature'] else "N/A",
-        "💧 Humidity"    : f"{live['humidity']} %"     if live['humidity']    else "N/A",
-        "💨 Wind"        : f"{live['wind_speed']} m/s" if live['wind_speed']  else "N/A",
-        "🔽 Pressure"    : f"{live['pressure']} hPa"   if live['pressure']    else "N/A",
+        "Temperature": f"{live['temperature']} C" if live.get("temperature") is not None else "N/A",
+        "Humidity": f"{live['humidity']} %" if live.get("humidity") is not None else "N/A",
+        "Wind": f"{live['wind_speed']} m/s" if live.get("wind_speed") is not None else "N/A",
+        "Pressure": f"{live['pressure']} hPa" if live.get("pressure") is not None else "N/A",
     }
-    for label, val in weather.items():
-        st.markdown(f"""
-        <div style='display: flex; justify-content: space-between; 
-                    padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
-                    color: #d1d5db; font-size: 0.9rem;'>
-            <span>{label}</span><span style='color: #60a5fa;'>{val}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    for label, value in weather.items():
+        st.markdown(f"**{label}:** {value}")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("###Model Info")
+    st.divider()
+    st.markdown("### Data")
+    st.caption(f"Station: {live.get('station', 'Karachi')}")
+    st.caption(f"Current AQI category: {current_cat}")
+    st.caption(f"Forecast points: {len(forecast_points)}")
+    st.caption(f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    st.divider()
+    st.markdown("### Model")
     if model is not None:
-        st.success("Model loaded ✓")
-        st.caption("Type: XGBoost Classifier")
-        feature_cols = (feat_info.get("selected_features") or feat_info.get("feature_cols") or []) if feat_info else []
-        st.caption(f"Features: {len(feature_cols)}")
-        if not history.empty:
-            st.caption(f"Trained on: {len(history)} records")
+        features = (feat_info.get("selected_features") or feat_info.get("feature_cols") or []) if feat_info else []
+        st.success("Artifacts loaded")
+        st.caption("The trained model is kept as a fallback when the OpenWeather forecast is unavailable.")
+        st.caption(f"Features: {len(features)}")
     else:
-        st.warning("Model not found. Run training_pipeline.py first.")
+        st.warning("Model artifacts not found")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 📡 Station")
-    st.caption(live.get("station", "Karachi"))
-    st.caption("Source: OpenWeather API")
-    st.caption(f"Updated: {live['time']}")
-
-    if st.button("Refresh Data"):
+    if st.button("Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()

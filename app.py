@@ -519,10 +519,10 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 🤖 Model Info")
+    st.markdown("###Model Info")
     if model is not None:
         st.success("Model loaded ✓")
-        st.caption("Type: Random Forest")
+        st.caption("Type: XGBoost Classifier")
         feature_cols = (feat_info.get("selected_features") or feat_info.get("feature_cols") or []) if feat_info else []
         st.caption(f"Features: {len(feature_cols)}")
         if not history.empty:
@@ -536,6 +536,6 @@ with st.sidebar:
     st.caption("Source: OpenWeather API")
     st.caption(f"Updated: {live['time']}")
 
-    if st.button("🔄 Refresh Data"):
+    if st.button("Refresh Data"):
         st.cache_data.clear()
         st.rerun()

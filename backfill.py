@@ -1,7 +1,8 @@
 import pandas as pd
 from pymongo import MongoClient
-from datetime import datetime
 from config import MONGODB_URI, MONGODB_DB, AQI_DATA_FILE
+from feature_pipeline import FEATURE_FILE
+from features import build_feature_frame
 import sys
 
 
@@ -41,6 +42,7 @@ def upload_to_mongodb():
     try:
         db = client[MONGODB_DB]
         collection = db["aqi_data"]
+        feature_collection = db["feature_store"]
         
         print(f"\nDatabase: {MONGODB_DB}")
         print(f"Collection: aqi_data")
@@ -66,6 +68,19 @@ def upload_to_mongodb():
         collection.create_index("timestamp")
         print("✓ Index created successfully")
         
+        print("\nComputing engineered features for feature_store...")
+        feature_df = build_feature_frame(df, include_future_target=True)
+        feature_collection.delete_many({})
+        feature_records = feature_df.to_dict("records")
+        if feature_records:
+            feature_collection.insert_many(feature_records)
+        feature_collection.create_index("datetime")
+        feature_collection.create_index("target_aqi_72h")
+        FEATURE_FILE.parent.mkdir(exist_ok=True)
+        feature_df.to_csv(FEATURE_FILE, index=False)
+        print(f"Stored {len(feature_records)} engineered rows in MongoDB feature_store")
+        print(f"Feature CSV written to {FEATURE_FILE}")
+
         print(f"\nBackfill completed successfully!")
         
         return True

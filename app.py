@@ -26,7 +26,8 @@ LONGITUDE = 67.0011
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "aqi_predictor")
-MODEL_PATH = Path("data/aqi_xgb_model.pkl")
+MODEL_PATH = Path("data/aqi_forecast_model.pkl")
+LEGACY_MODEL_PATH = Path("data/aqi_xgb_model.pkl")
 LE_PATH = Path("data/label_encoder.pkl")
 FEAT_PATH = Path("data/feature_columns.pkl")
 POLLUTANTS = ["co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"]
@@ -312,9 +313,10 @@ def openweather_get(endpoint, params):
 
 @st.cache_resource(show_spinner="Loading model artifacts...")
 def load_model():
-    if not MODEL_PATH.exists() or not LE_PATH.exists() or not FEAT_PATH.exists():
+    model_path = MODEL_PATH if MODEL_PATH.exists() else LEGACY_MODEL_PATH
+    if not model_path.exists() or not LE_PATH.exists() or not FEAT_PATH.exists():
         return None, None, None
-    with open(MODEL_PATH, "rb") as f:
+    with open(model_path, "rb") as f:
         model = pickle.load(f)
     with open(LE_PATH, "rb") as f:
         le = pickle.load(f)
@@ -382,11 +384,18 @@ def load_history():
             serverSelectionTimeoutMS=8000,
         )
         records = list(
-            client[MONGODB_DB]["aqi_data"]
+            client[MONGODB_DB]["feature_store"]
             .find({}, {"_id": 0})
             .sort("datetime", -1)
             .limit(720)
         )
+        if not records:
+            records = list(
+                client[MONGODB_DB]["aqi_data"]
+                .find({}, {"_id": 0})
+                .sort("datetime", -1)
+                .limit(720)
+            )
         if not records:
             return pd.DataFrame()
         df = pd.DataFrame(records)
@@ -398,7 +407,7 @@ def load_history():
 
 def predict_model_fallback(model, le, feat_info, live):
     predictions = []
-    if model is None or le is None or feat_info is None or live is None:
+    if model is None or feat_info is None or live is None:
         return predictions
 
     feature_cols = feat_info.get("selected_features") or feat_info.get("feature_cols") or []
@@ -411,6 +420,10 @@ def predict_model_fallback(model, le, feat_info, live):
     for h in range(1, 73):
         next_time = last_time + timedelta(hours=h)
         row = {
+            "hour": next_time.hour,
+            "day": next_time.day,
+            "month": next_time.month,
+            "day_of_week": next_time.weekday(),
             "day_of_year": next_time.timetuple().tm_yday,
             "week": next_time.isocalendar()[1],
         }
@@ -438,16 +451,22 @@ def predict_model_fallback(model, le, feat_info, live):
 
         x_vec = np.array([row.get(f, 0.0) for f in feature_cols]).reshape(1, -1)
         try:
-            pred_enc = model.predict(x_vec)[0]
-            pred_class = int(le.inverse_transform([pred_enc])[0])
-            confidence = float(model.predict_proba(x_vec)[0].max()) if hasattr(model, "predict_proba") else None
+            raw_pred = float(model.predict(x_vec)[0])
+            if le is not None:
+                pred_class = int(le.inverse_transform([int(raw_pred)])[0])
+                class_to_aqi = {1: 35, 2: 75, 3: 125, 4: 175, 5: 225}
+                pred_aqi = class_to_aqi.get(pred_class, raw_pred)
+                confidence = float(model.predict_proba(x_vec)[0].max()) if hasattr(model, "predict_proba") else None
+            else:
+                pred_aqi = max(0.0, min(500.0, raw_pred))
+                pred_class = live.get("openweather_class", 3)
+                confidence = None
         except Exception:
             break
 
-        class_to_aqi = {1: 35, 2: 75, 3: 125, 4: 175, 5: 225}
         predictions.append({
             "datetime": next_time,
-            "aqi": class_to_aqi.get(pred_class, None),
+            "aqi": pred_aqi,
             "openweather_class": pred_class,
             "confidence": confidence,
         })

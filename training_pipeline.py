@@ -1,267 +1,264 @@
-import warnings
-warnings.filterwarnings("ignore")
+import pickle
+import sys
+import os
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import pickle
-import sys
-from pathlib import Path
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.metrics import (
-    classification_report, confusion_matrix,
-    accuracy_score, f1_score, mean_absolute_error
-)
-import xgboost as xgb
 import shap
-from imblearn.over_sampling import SMOTE
-from config import AQI_DATA_FILE, DATA_DIR
+import xgboost as xgb
+from pymongo import MongoClient
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-POLLUTANTS       = ["co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3"]
-TARGET           = "aqi"
-FORECAST_HORIZON = 72
-RANDOM_STATE     = 42
-TOP_N_FEATURES   = 15
+from config import AQI_DATA_FILE, DATA_DIR, MONGODB_DB, MONGODB_URI
+from feature_pipeline import FEATURE_FILE
+from features import TARGET_72H, build_feature_frame, model_feature_columns
 
-AQI_LABELS = {2: "Good", 3: "Moderate", 4: "Unhealthy (Sensitive)", 5: "Unhealthy"}
+RANDOM_STATE = 42
+HOLDOUT_HOURS = 72
+MODEL_COLLECTION = "model_registry"
 
-def train_model():
-    
-    print("=" * 70)
-    print("AQI 3-Day Forecast Pipeline - Training")
-    print("=" * 70)
-    
+
+def load_training_frame() -> pd.DataFrame:
+    if MONGODB_URI and os.getenv("SKIP_MONGODB") != "1":
+        try:
+            client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+            client.admin.command("ping")
+            records = list(
+                client[MONGODB_DB]["feature_store"]
+                .find({TARGET_72H: {"$exists": True}}, {"_id": 0})
+                .sort("datetime", 1)
+            )
+            client.close()
+            if records:
+                print(f"Loaded {len(records)} feature rows from MongoDB feature_store")
+                return pd.DataFrame(records)
+        except Exception as exc:
+            print(f"Feature store unavailable, falling back to local files: {exc}")
+
+    if FEATURE_FILE.exists():
+        print(f"Loaded features from {FEATURE_FILE}")
+        return pd.read_csv(FEATURE_FILE)
+
+    if not AQI_DATA_FILE.exists():
+        raise FileNotFoundError(f"No feature store or CSV data found. Missing {AQI_DATA_FILE}")
+
+    print(f"Building features from {AQI_DATA_FILE}")
+    return build_feature_frame(pd.read_csv(AQI_DATA_FILE), include_future_target=True)
+
+
+def evaluate_model(name: str, model, X_train, y_train, X_test, y_test) -> dict:
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, pred))
+    mae = mean_absolute_error(y_test, pred)
+    r2 = r2_score(y_test, pred)
+
+    tscv = TimeSeriesSplit(n_splits=5)
+    cv_rmse = -cross_val_score(
+        model,
+        X_train,
+        y_train,
+        cv=tscv,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1,
+    ).mean()
+
+    return {
+        "name": name,
+        "model": model,
+        "predictions": pred,
+        "rmse": float(rmse),
+        "mae": float(mae),
+        "r2": float(r2),
+        "cv_rmse": float(cv_rmse),
+    }
+
+
+def save_model_registry_entry(metrics: dict, feature_cols: list[str], artifact_paths: dict) -> None:
+    registry_doc = {
+        "model_name": "aqi_72h_forecaster",
+        "model_type": metrics["name"],
+        "created_at": datetime.now(timezone.utc),
+        "target": TARGET_72H,
+        "forecast_horizon_hours": HOLDOUT_HOURS,
+        "metrics": {
+            "rmse": metrics["rmse"],
+            "mae": metrics["mae"],
+            "r2": metrics["r2"],
+            "cv_rmse": metrics["cv_rmse"],
+        },
+        "feature_count": len(feature_cols),
+        "features": feature_cols,
+        "artifacts": {key: str(value) for key, value in artifact_paths.items()},
+    }
+
+    DATA_DIR.mkdir(exist_ok=True)
+    registry_file = DATA_DIR / "model_registry_latest.pkl"
+    with open(registry_file, "wb") as f:
+        pickle.dump(registry_doc, f)
+
+    if not MONGODB_URI or os.getenv("SKIP_MONGODB") == "1":
+        print(f"MongoDB not configured; registry metadata saved locally to {registry_file}")
+        return
+
     try:
-        print("\nLoading data from CSV...")
-        if not AQI_DATA_FILE.exists():
-            print(f"Data file not found: {AQI_DATA_FILE}")
-            print("   Please run backfill.py or fetch_aqi_data.py first")
-            return False
-        
-        df = pd.read_csv(AQI_DATA_FILE)
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000)
+        client.admin.command("ping")
+        collection = client[MONGODB_DB][MODEL_COLLECTION]
+        collection.insert_one(registry_doc)
+        collection.create_index("created_at")
+        print(f"Registered model in MongoDB collection: {MODEL_COLLECTION}")
+    except Exception as exc:
+        print(f"Could not write MongoDB model registry entry: {exc}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def train_model() -> bool:
+    print("=" * 70)
+    print("AQI 72-hour Forecast Training Pipeline")
+    print("=" * 70)
+
+    try:
+        df = load_training_frame()
         df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        df = df.drop(columns=["_id", "timestamp"], errors="ignore")
-        
-        print(f"Loaded {len(df)} records")
-        print(f"   Date range: {df['datetime'].min().date()} → {df['datetime'].max().date()}")
-        print(f"   AQI distribution:\n{df[TARGET].value_counts().sort_index()}")
-        
-        print("\nCleaning data - clipping outliers...")
-        for col in POLLUTANTS:
-            Q1, Q3 = df[col].quantile([0.25, 0.75])
-            fence = 3 * (Q3 - Q1)
-            df[col] = df[col].clip(lower=Q1 - fence, upper=Q3 + fence)
-        print("Outliers clipped (3×IQR method)")
-        
-        print("\nEngineering important SHAP-identified features...")
-        dt = df["datetime"]
-        
-        df["day_of_year"] = dt.dt.dayofyear
-        df["week"] = dt.dt.isocalendar().week.astype(int)
-        
-        df["pm10_lag1"] = df["pm10"].shift(1)
-        df["pm10_lag3"] = df["pm10"].shift(3)
-        df["pm2_5_lag1"] = df["pm2_5"].shift(1)
-        df["aqi_lag1"] = df[TARGET].shift(1)
-        df["co_lag12"] = df["co"].shift(12)
-        
-        df["pm_ratio"] = df["pm2_5"] / (df["pm10"] + 1e-6)
-        df["pm2_5_x_no2"] = df["pm2_5"] * df["no2"]
-        df["so2_x_pm10"] = df["so2"] * df["pm10"]
-        
-        df["aqi_trend3"] = df[TARGET].diff(3)
-        df["aqi_trend6"] = df[TARGET].diff(6)
-        
-        df = df.dropna().reset_index(drop=True)
-        
-        feature_cols = [c for c in df.columns
-                        if c not in ["datetime", TARGET] and not c.startswith("_")]
-        
-        print(f"Total features engineered: {len(feature_cols)}")
-        print(f"   Data shape after feature engineering: {df.shape}")
-        
-        print("\nSplitting data (time-aware)...")
-        SPLIT_IDX = len(df) - FORECAST_HORIZON
-        train_df  = df.iloc[:SPLIT_IDX]
-        test_df   = df.iloc[SPLIT_IDX:]
-        
-        X_train, y_train = train_df[feature_cols].values, train_df[TARGET].values
-        X_test,  y_test  = test_df[feature_cols].values,  test_df[TARGET].values
-        
-        le = LabelEncoder()
-        y_train_enc = le.fit_transform(y_train)
-        y_test_enc  = le.transform(y_test)
-        
-        print(f"Train: {len(X_train)} rows | Test (72h hold-out): {len(X_test)} rows")
-        print(f"   Classes: {dict(zip(le.classes_, np.bincount(y_train_enc)))}")
-        
-        print("\nApplying SMOTE for class balance...")
-        smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=5)
-        X_resampled, y_resampled = smote.fit_resample(X_train, y_train_enc)
-        
-        print(f"SMOTE applied")
-        print(f"   Before: {len(X_train)} samples")
-        print(f"   After:  {len(X_resampled)} samples")
-        print(f"   Resampled dist: {dict(zip(le.classes_, np.bincount(y_resampled)))}")
-        
-        print("\nTraining XGBoost classifier...")
-        params = dict(
-            n_estimators      = 800,
-            max_depth         = 7,
-            learning_rate     = 0.05,
-            subsample         = 0.8,
-            colsample_bytree  = 0.8,
-            reg_alpha         = 0.1,
-            reg_lambda        = 1.0,
-            min_child_weight  = 3,
-            gamma             = 0.1,
-            objective         = "multi:softmax",
-            num_class         = len(le.classes_),
-            eval_metric       = "merror",
-            use_label_encoder = False,
-            random_state      = RANDOM_STATE,
-            n_jobs            = -1,
-            tree_method       = "hist",
-            early_stopping_rounds = 50,
-        )
-        
-        model = xgb.XGBClassifier(**params)
-        model.fit(
-            X_resampled, y_resampled,
-            eval_set=[(X_test, y_test_enc)],
-            verbose=100,
-        )
-        print(f"Model trained (best iteration: {model.best_iteration})")
-        
-        print("\nEvaluating model...")
-        y_pred_enc = model.predict(X_test)
-        y_pred     = le.inverse_transform(y_pred_enc)
-        y_true     = y_test
-        
-        acc = accuracy_score(y_true, y_pred)
-        f1  = f1_score(y_true, y_pred, average="weighted")
-        mae = mean_absolute_error(y_true, y_pred)
-        
-        print(f"   Accuracy:        {acc:.4f}")
-        print(f"   Weighted F1:     {f1:.4f}")
-        print(f"   Mean Abs Error:  {mae:.4f} AQI classes")
-        
-        present_classes = sorted(set(y_true) | set(y_pred))
-        print(f"\n   Classification Report:")
-        print(classification_report(
-            y_true, y_pred,
-            labels=present_classes,
-            target_names=[AQI_LABELS.get(c, str(c)) for c in present_classes]
-        ))
-        
-        tscv = TimeSeriesSplit(n_splits=5)
-        cv_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
-        cv_scores = cross_val_score(
-            xgb.XGBClassifier(**cv_params), X_train, y_train_enc,
-            cv=tscv, scoring="accuracy", n_jobs=-1
-        )
-        print(f"   Time-Series CV: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-        
-        print("\nComputing SHAP feature importance...")
-        explainer  = shap.TreeExplainer(model)
-        shap_data  = np.vstack([X_train[-200:], X_test])
-        shap_vals  = explainer.shap_values(shap_data)
-        
-        if isinstance(shap_vals, list):
-            mean_abs_shap = np.mean([np.abs(sv) for sv in shap_vals], axis=0)
-        elif shap_vals.ndim == 3:
-            mean_abs_shap = np.abs(shap_vals).mean(axis=2)
+        df = df.sort_values("datetime").dropna().reset_index(drop=True)
+
+        feature_cols = model_feature_columns(df, TARGET_72H)
+        if len(df) <= HOLDOUT_HOURS:
+            raise ValueError("Not enough rows for a 72-hour holdout split")
+
+        split_idx = len(df) - HOLDOUT_HOURS
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
+
+        X_train = train_df[feature_cols]
+        y_train = train_df[TARGET_72H].astype(float)
+        X_test = test_df[feature_cols]
+        y_test = test_df[TARGET_72H].astype(float)
+
+        print(f"Rows: {len(df)} | Train: {len(train_df)} | 72h holdout: {len(test_df)}")
+        print(f"Date range: {df['datetime'].min()} to {df['datetime'].max()}")
+        print(f"Features: {len(feature_cols)}")
+
+        models = [
+            ("Ridge Regression", Pipeline([
+                ("scale", StandardScaler()),
+                ("ridge", Ridge(alpha=1.0)),
+            ])),
+            ("Random Forest", RandomForestRegressor(
+                n_estimators=500,
+                min_samples_leaf=2,
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            )),
+            ("XGBoost", xgb.XGBRegressor(
+                n_estimators=700,
+                max_depth=5,
+                learning_rate=0.04,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                objective="reg:squarederror",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                tree_method="hist",
+            )),
+        ]
+
+        results = [
+            evaluate_model(name, model, X_train, y_train, X_test, y_test)
+            for name, model in models
+        ]
+        results = sorted(results, key=lambda item: item["rmse"])
+
+        print("\nModel comparison")
+        for result in results:
+            print(
+                f"{result['name']:<18} "
+                f"RMSE={result['rmse']:.4f} "
+                f"MAE={result['mae']:.4f} "
+                f"R2={result['r2']:.4f} "
+                f"CV_RMSE={result['cv_rmse']:.4f}"
+            )
+
+        best = results[0]
+        final_model = best["model"]
+        final_model.fit(df[feature_cols], df[TARGET_72H].astype(float))
+
+        shap_importance = pd.DataFrame()
+        if best["name"] in {"Random Forest", "XGBoost"}:
+            sample = df[feature_cols].tail(min(250, len(df)))
+            explainer = shap.TreeExplainer(final_model)
+            shap_values = explainer.shap_values(sample)
+            shap_importance = pd.DataFrame({
+                "feature": feature_cols,
+                "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+            }).sort_values("mean_abs_shap", ascending=False)
         else:
-            mean_abs_shap = np.abs(shap_vals)
-        
-        shap_importance = pd.DataFrame({
-            "feature":       feature_cols,
-            "mean_abs_shap": mean_abs_shap.mean(axis=0)
-        }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-        
-        print(f"Top 25 SHAP features:")
-        print(shap_importance.head(25).to_string(index=False))
-        
-        print(f"\nRetraining with top {TOP_N_FEATURES} SHAP features...")
-        top_features = shap_importance.head(TOP_N_FEATURES)["feature"].tolist()
-        feat_idx     = [feature_cols.index(f) for f in top_features]
-        
-        X_tr_top = X_resampled[:, feat_idx]
-        X_te_top = X_test[:, feat_idx]
-        
-        model_shap = xgb.XGBClassifier(**{k: v for k, v in params.items()
-                                           if k != "early_stopping_rounds"})
-        model_shap.set_params(n_estimators=model.best_iteration + 1)
-        model_shap.fit(X_tr_top, y_resampled)
-        
-        y_pred_shap     = model_shap.predict(X_te_top)
-        y_pred_shap_dec = le.inverse_transform(y_pred_shap)
-        
-        acc2 = accuracy_score(y_true, y_pred_shap_dec)
-        f1_2 = f1_score(y_true, y_pred_shap_dec, average="weighted")
-        mae2 = mean_absolute_error(y_true, y_pred_shap_dec)
-        
-        print(f"SHAP-Pruned Model Performance:")
-        print(f"   Accuracy:       {acc2:.4f}")
-        print(f"   Weighted F1:    {f1_2:.4f}")
-        print(f"   Mean Abs Error: {mae2:.4f}")
-        
-        if f1_2 >= f1 - 0.005:
-            final_model = model_shap
-            final_feats = top_features
-            final_fidx = feat_idx
-            print(f"   Using SHAP-pruned model (fewer features, same performance)")
-        else:
-            final_model = model
-            final_feats = feature_cols
-            final_fidx = list(range(len(feature_cols)))
-            print(f"   Using full-feature model")
-        
-        print("\nSaving model artifacts...")
+            coefficients = final_model.named_steps["ridge"].coef_
+            shap_importance = pd.DataFrame({
+                "feature": feature_cols,
+                "mean_abs_shap": np.abs(coefficients),
+            }).sort_values("mean_abs_shap", ascending=False)
+
         DATA_DIR.mkdir(exist_ok=True)
-        
         model_path = DATA_DIR / "aqi_xgb_model.pkl"
+        forecast_model_path = DATA_DIR / "aqi_forecast_model.pkl"
         le_path = DATA_DIR / "label_encoder.pkl"
         feat_path = DATA_DIR / "feature_columns.pkl"
         shap_path = DATA_DIR / "shap_importance.pkl"
         shap_csv_path = DATA_DIR / "shap_feature_importance.csv"
-        
-        with open(model_path, 'wb') as f:
+
+        with open(model_path, "wb") as f:
             pickle.dump(final_model, f)
-        
-        with open(le_path, 'wb') as f:
-            pickle.dump(le, f)
-        
-        with open(feat_path, 'wb') as f:
-            pickle.dump({"feature_cols": feature_cols, "selected_features": final_feats, "selected_indices": final_fidx}, f)
-        
-        with open(shap_path, 'wb') as f:
+        with open(forecast_model_path, "wb") as f:
+            pickle.dump(final_model, f)
+        with open(le_path, "wb") as f:
+            pickle.dump(None, f)
+        with open(feat_path, "wb") as f:
+            pickle.dump({
+                "feature_cols": feature_cols,
+                "selected_features": feature_cols,
+                "target": TARGET_72H,
+                "forecast_horizon_hours": HOLDOUT_HOURS,
+                "model_type": best["name"],
+            }, f)
+        with open(shap_path, "wb") as f:
             pickle.dump(shap_importance, f)
-        
         shap_importance.to_csv(shap_csv_path, index=False)
-        
-        print(f"Model saved:               {model_path}")
-        print(f"   Label encoder saved:      {le_path}")
-        print(f"   Feature columns saved:    {feat_path}")
-        print(f"   SHAP importance saved:    {shap_path}")
-        print(f"   SHAP CSV saved:           {shap_csv_path}")
-        
-        print("\n" + "=" * 70)
-        print("FINAL RESULTS")
-        print("=" * 70)
-        print(f"Features engineered:      {len(feature_cols)}")
-        print(f"SHAP-selected features:   {TOP_N_FEATURES}")
-        print(f"Accuracy (72h hold-out):  {acc2:.2%}")
-        print(f"Weighted F1:              {f1_2:.4f}")
-        print(f"Mean Absolute Error:      {mae2:.4f} AQI classes")
-        print(f"Forecast horizon:         72 hours (3 days)")
-        print("=" * 70)
-        
+
+        save_model_registry_entry(
+            best,
+            feature_cols,
+            {
+                "model": model_path,
+                "forecast_model": forecast_model_path,
+                "features": feat_path,
+                "importance": shap_csv_path,
+            },
+        )
+
+        print("\nFINAL RESULTS")
+        print(f"Best model:     {best['name']}")
+        print(f"RMSE:           {best['rmse']:.4f}")
+        print(f"MAE:            {best['mae']:.4f}")
+        print(f"R2:             {best['r2']:.4f}")
+        print(f"Model saved:    {forecast_model_path}")
+        print(f"App alias:      {model_path}")
+        print(f"SHAP saved:     {shap_csv_path}")
         return True
-        
-    except Exception as e:
-        print(f"\nError during training: {e}")
+
+    except Exception as exc:
+        print(f"Error during training: {exc}")
         import traceback
         traceback.print_exc()
         return False

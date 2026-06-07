@@ -20,7 +20,6 @@ Run by visiting this url: https://aqipredictor10pearls.streamlit.app/
 | EDA to identify trends | Done | Dashboard trend charts and SHAP importance are present; notebook exists in `model_training/`. |
 | SHAP/LIME explanations | Done | SHAP feature importance is saved to `data/shap_feature_importance.csv`. |
 | Hazardous AQI alerts | Done | `app.py` displays a health alert when AQI exceeds unhealthy thresholds. |
-| Deep learning model | Not implemented | TensorFlow/PyTorch is not included because the dataset is small and the final pipeline focuses on stable classical models plus XGBoost. |
 
 ## What Was Built
 

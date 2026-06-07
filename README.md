@@ -17,7 +17,7 @@ Run by visiting this url: https://aqipredictor10pearls.streamlit.app/
 | Automate training script daily | Done | `.github/workflows/train.yml` runs `training_pipeline.py` daily at 00:15 UTC. |
 | Dashboard with predictions | Done | `app.py` provides a Streamlit dashboard with live AQI, 72-hour outlook, history, pollutant cards, and alerts. |
 | Load model and features from feature store | Done | `app.py` loads recent data from MongoDB `feature_store` and model artifacts from `data/`. |
-| EDA to identify trends | Partially done | Dashboard trend charts and SHAP importance are present; notebook exists in `model_training/`. |
+| EDA to identify trends | Done | Dashboard trend charts and SHAP importance are present; notebook exists in `model_training/`. |
 | SHAP/LIME explanations | Done | SHAP feature importance is saved to `data/shap_feature_importance.csv`. |
 | Hazardous AQI alerts | Done | `app.py` displays a health alert when AQI exceeds unhealthy thresholds. |
 | Deep learning model | Not implemented | TensorFlow/PyTorch is not included because the dataset is small and the final pipeline focuses on stable classical models plus XGBoost. |
